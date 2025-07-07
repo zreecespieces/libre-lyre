@@ -2,9 +2,10 @@ import { app, shell, BrowserWindow, ipcMain } from "electron"
 import { join } from "path"
 import { electronApp, optimizer, is } from "@electron-toolkit/utils"
 import icon from "../../resources/icon.png?asset"
-import * as fs from "fs/promises"
-
-import { PDFDocument } from "pdf-lib"
+import { promises as fs } from "fs"
+import { pdfToPng } from "pdf-to-png-converter"
+import sharp from "sharp"
+import { createWorker } from "tesseract.js"
 
 function createWindow(): void {
   // Create the browser window.
@@ -73,69 +74,80 @@ app.on("window-all-closed", () => {
   }
 })
 
-// In this file you can include the rest of your app's specific main process
-// code. You can also put them in separate files and require them here.
-
 // IPC handler for audiobook processing
-ipcMain.handle("process-audiobook", async (_event, { pdfData, pageRange, cropSettings }) => {
+ipcMain.handle("process-audiobook", async (_event, { pdfBuffer, pageRange, cropSettings }) => {
   try {
     console.log("Processing audiobook request:", {
       pageRange,
       cropSettings,
-      pdfDataLength: pdfData.length
+      pdfBufferLength: pdfBuffer.length
     })
-
-    // Convert array back to Uint8Array
-    const pdfBytes = new Uint8Array(pdfData)
-    const pdfDoc = await PDFDocument.load(pdfBytes)
 
     const [startPage, endPage] = pageRange
     const pagesToProcess = endPage - startPage + 1
 
-    // Create a new PDF with selected pages and cropping
-    const croppedPdf = await PDFDocument.create()
+    console.log(`Crop settings: top=${cropSettings.top}px, bottom=${cropSettings.bottom}px`)
 
-    for (let i = startPage - 1; i < endPage; i++) {
-      if (i >= pdfDoc.getPageCount()) break
+    const images = await pdfToPng(pdfBuffer, {
+      outputFolder: "libre-lyre-temp",
+      viewportScale: 2,
+      outputFileMaskFunc: (pageNumber) => `page_${pageNumber}.png`,
+      disableFontFace: true,
+      pagesToProcess: [startPage, endPage]
+    })
 
-      const [copiedPage] = await croppedPdf.copyPages(pdfDoc, [i])
-      const { width, height } = copiedPage.getSize()
+    const topMarginPx = cropSettings.top * 2 // times two because we scaled the image by 2
+    const bottomMarginPx = cropSettings.bottom * 2 // times two because we scaled the image by 2
 
-      // Apply cropping based on settings
-      const topCrop = height * cropSettings.top
-      const bottomCrop = height * cropSettings.bottom
+    const worker = await createWorker("eng")
 
-      copiedPage.setCropBox(0, bottomCrop, width, height - topCrop)
+    let extractedText = ""
 
-      croppedPdf.addPage(copiedPage)
+    for (const image of images) {
+      const imageBuffer = image.content
+      const imageHeight = image.height
+      const imageWidth = image.width
+
+      const sharpOptions = {
+        left: 0,
+        top: topMarginPx,
+        width: Math.floor(imageWidth),
+        height: Math.floor(imageHeight - topMarginPx - bottomMarginPx)
+      }
+
+      console.log("Cropping image")
+      const croppedImageBuffer = await sharp(imageBuffer).extract(sharpOptions).toBuffer()
+
+      const {
+        data: { text }
+      } = await worker.recognize(croppedImageBuffer)
+      extractedText += text
+
+      console.log("Extracted text from page: " + image.pageNumber, "text: " + text)
     }
 
-    // Save cropped PDF to temporary file
-    const croppedPdfBytes = await croppedPdf.save()
-    const tempPdfPath = join(__dirname, `temp-${Date.now()}.cropped.pdf`)
-    await fs.writeFile(tempPdfPath, croppedPdfBytes)
-
-    // Dynamically import scribe.js-ocr (ESM module with top-level await)
-    const { default: scribe } = await import("scribe.js-ocr")
-
-    // Initialize scribe.js for OCR
-    await scribe.init({ ocr: true, font: true })
-
-    // Extract text directly from the cropped PDF using scribe.js
-    const extractedText = await scribe.extractText([tempPdfPath])
+    // Cleanup any words broken by line (e.g. "con- fusedly" -> "confusedly")
+    // Fix hyphenated words at line breaks (e.g., "con-\nfusedly" -> "confusedly")
+    const cleanedText = extractedText
+      .replace(/\s+/g, " ") // Replace multiple spaces with single space
+      .replace(/\n+/g, "\n") // Replace multiple newlines with single newline
+      .replace(/(\w+)-\s+(\w+)/g, "$1$2") // Hyphen + space
+      .replace(/(\w+)-\n(\w+)/g, "$1$2") // Hyphen + newline
+      .replace(/\n/g, " ") // Replace newlines with spaces
+    console.log("Cleaned text:", cleanedText)
 
     // Debug logging
-    console.log(`Extracted text length: ${extractedText.length} characters`)
-    console.log(`First 200 characters: ${extractedText.substring(0, 200)}...`)
-    console.log(`Last 200 characters: ...${extractedText.substring(extractedText.length - 200)}`)
+    console.log(`Extracted text length: ${cleanedText.length} characters`)
+    console.log(`First 200 characters: ${cleanedText.substring(0, 200)}...`)
+    console.log(`Last 200 characters: ...${cleanedText.substring(cleanedText.length - 200)}`)
     console.log(`Pages processed: ${pagesToProcess} (from page ${startPage} to ${endPage})`)
 
-    // Clean up temporary file
-    await fs.unlink(tempPdfPath)
+    // Delete temp folder
+    fs.rmdir("libre-lyre-temp", { recursive: true })
 
     return {
       success: true,
-      text: extractedText,
+      text: cleanedText,
       pageCount: pagesToProcess
     }
   } catch (error) {
@@ -145,61 +157,6 @@ ipcMain.handle("process-audiobook", async (_event, { pdfData, pageRange, cropSet
       error: error instanceof Error ? error.message : "Unknown processing error"
     }
   }
-})
-
-// IPC handler for audio concatenation
-ipcMain.handle("concatenate-audio", async (_event, { audioFiles, outputFile }) => {
-  try {
-    console.log(`Concatenating ${audioFiles.length} audio files into ${outputFile}`)
-
-    // Simple concatenation by reading and combining audio data
-    const audioBuffers: Buffer[] = []
-
-    for (const audioFile of audioFiles) {
-      try {
-        const audioData = await fs.readFile(audioFile)
-        audioBuffers.push(audioData)
-
-        // Clean up individual chunk file
-        await fs.unlink(audioFile)
-      } catch (fileError) {
-        console.warn(`Could not read/delete audio file ${audioFile}:`, fileError)
-      }
-    }
-
-    if (audioBuffers.length === 0) {
-      throw new Error("No valid audio files found")
-    }
-
-    // For WAV files, we need to combine them properly
-    // This is a simple approach - for production, consider using ffmpeg
-    if (audioBuffers.length === 1) {
-      // Single file, just rename it
-      await fs.writeFile(outputFile, audioBuffers[0])
-    } else {
-      // Multiple files - simple concatenation (this may not work perfectly for WAV)
-      // For now, just use the first file as the base
-      console.warn(
-        "Simple audio concatenation may not work perfectly - consider implementing ffmpeg"
-      )
-      const combinedBuffer = Buffer.concat(audioBuffers)
-      await fs.writeFile(outputFile, combinedBuffer)
-    }
-
-    console.log(`Audio concatenation completed: ${outputFile}`)
-    return { success: true }
-  } catch (error) {
-    console.error("Audio concatenation error:", error)
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : "Audio concatenation failed"
-    }
-  }
-})
-
-// IPC handler for getting Downloads directory path
-ipcMain.handle("get-downloads-path", () => {
-  return app.getPath("downloads")
 })
 
 // IPC handler for audio buffer concatenation (no file saving required)

@@ -22,8 +22,13 @@ import "react-pdf/dist/Page/TextLayer.css"
 pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.js"
 
 interface CropSettings {
-  top: number // percentage
-  bottom: number // percentage
+  top: number // pixels from top
+  bottom: number // pixels from bottom
+}
+
+interface PDFPageInfo {
+  width: number // pixels
+  height: number // pixels
 }
 
 interface ProcessingState {
@@ -38,7 +43,9 @@ function App(): React.JSX.Element {
   const [numPages, setNumPages] = useState<number>(0)
   const [currentPage, setCurrentPage] = useState<number>(1)
   const [pageRange, setPageRange] = useState<[number, number]>([1, 1])
-  const [cropSettings, setCropSettings] = useState<CropSettings>({ top: 10, bottom: 10 })
+  const [pageInfo, setPageInfo] = useState<PDFPageInfo>({ width: 612, height: 792 }) // Default letter size
+  const [cropSettings, setCropSettings] = useState<CropSettings>({ top: 50, bottom: 50 }) // Default 50px margins
+  const [cropInitialized, setCropInitialized] = useState<boolean>(false) // Track if crop settings have been initialized
   const [processing, setProcessing] = useState<ProcessingState>({
     status: "idle",
     progress: 0,
@@ -64,6 +71,31 @@ function App(): React.JSX.Element {
     setCurrentPage(1)
     setPageRange([1, numPages])
   }, [])
+
+  // Extract page dimensions when page loads for pixel-based cropping
+  const onPageLoadSuccess = useCallback(
+    (page) => {
+      const { width, height } = page.getViewport({ scale: 1.0 })
+      console.log(`PDF page dimensions: ${width}x${height} pixels`)
+      setPageInfo({ width, height })
+
+      // Only set default crop settings on first load, not on page navigation
+      if (!cropInitialized) {
+        const defaultTopMargin = Math.round(height * 0.08) // ~8% of page height
+        const defaultBottomMargin = Math.round(height * 0.08) // ~8% of page height
+        setCropSettings({ top: defaultTopMargin, bottom: defaultBottomMargin })
+        setCropInitialized(true)
+        console.log(
+          `Initialized default crop settings: top=${defaultTopMargin}px, bottom=${defaultBottomMargin}px`
+        )
+      } else {
+        console.log(
+          `Page changed - preserving existing crop settings: top=${cropSettings.top}px, bottom=${cropSettings.bottom}px`
+        )
+      }
+    },
+    [cropInitialized, cropSettings.top, cropSettings.bottom]
+  )
 
   const handlePageRangeChange = useCallback((_: Event, newValue: number | number[]) => {
     if (Array.isArray(newValue)) {
@@ -97,14 +129,13 @@ function App(): React.JSX.Element {
 
       // Convert File to ArrayBuffer for transfer to main process
       const pdfArrayBuffer = await pdfFile.arrayBuffer()
-      const pdfUint8Array = new Uint8Array(pdfArrayBuffer)
 
       const result = await window.electron.ipcRenderer.invoke("process-audiobook", {
-        pdfData: Array.from(pdfUint8Array), // Convert to regular array for transfer
+        pdfBuffer: pdfArrayBuffer,
         pageRange,
         cropSettings: {
-          top: cropSettings.top / 100,
-          bottom: cropSettings.bottom / 100
+          top: cropSettings.top,
+          bottom: cropSettings.bottom
         }
       })
 
@@ -247,27 +278,15 @@ function App(): React.JSX.Element {
     }
   }
 
-  const testSpeechGeneration = async (): Promise<void> => {
-    const model_id = "onnx-community/Kokoro-82M-v1.0-ONNX"
-    const tts = await KokoroTTS.from_pretrained(model_id, {
-      dtype: "fp32",
-      device: "webgpu"
-    })
-
-    const text = "Is this really working! This is the craziest thing ever."
-    const audio = await tts.generate(text, { voice: "af_heart" })
-    await audio.save("test-audio.wav")
-  }
-
   return (
-    <Container maxWidth="lg" sx={{ py: 4, height: "100vh", overflow: "auto" }}>
+    <Container maxWidth="xl" sx={{ py: 4, height: "100vh", overflow: "auto" }}>
       <Typography variant="h4" component="h1" gutterBottom>
         Libre Lyre - Audiobook Generator
       </Typography>
 
-      <Stack spacing={3}>
+      <Stack direction="row" spacing={3}>
         {/* PDF Upload Section */}
-        <Card>
+        <Card sx={{ height: "max-content", width: pdfFile ? "max-content" : "100%" }}>
           <CardContent>
             <Typography variant="h6" gutterBottom>
               1. Upload PDF Document
@@ -335,46 +354,73 @@ function App(): React.JSX.Element {
                       loading={<div>Loading PDF...</div>}
                     >
                       <Box sx={{ position: "relative", display: "inline-block" }}>
-                        <Page pageNumber={currentPage} width={400} />
+                        <Page
+                          pageNumber={currentPage}
+                          width={400}
+                          onLoadSuccess={onPageLoadSuccess}
+                        />
 
-                        {/* Crop Overlay */}
-                        <Box
-                          sx={{
-                            position: "absolute",
-                            top: 0,
-                            left: 0,
-                            right: 0,
-                            height: `${cropSettings.top}%`,
-                            backgroundColor: "rgba(255, 0, 0, 0.3)",
-                            borderBottom: "2px solid red",
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "center"
-                          }}
-                        >
-                          <Typography variant="caption" sx={{ color: "white", fontWeight: "bold" }}>
-                            HEADER AREA (EXCLUDED)
-                          </Typography>
-                        </Box>
+                        {/* Pixel-based Crop Overlay - Exact WYSIWYG alignment */}
+                        {(() => {
+                          // Calculate scale factor: display width (400px) / actual PDF width
+                          const scaleFactor = 400 / pageInfo.width
 
-                        <Box
-                          sx={{
-                            position: "absolute",
-                            bottom: 0,
-                            left: 0,
-                            right: 0,
-                            height: `${cropSettings.bottom}%`,
-                            backgroundColor: "rgba(255, 0, 0, 0.3)",
-                            borderTop: "2px solid red",
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "center"
-                          }}
-                        >
-                          <Typography variant="caption" sx={{ color: "white", fontWeight: "bold" }}>
-                            FOOTER AREA (EXCLUDED)
-                          </Typography>
-                        </Box>
+                          // Convert pixel crop values to display coordinates
+                          const topPixelsDisplay = cropSettings.top * scaleFactor
+                          const bottomPixelsDisplay = cropSettings.bottom * scaleFactor
+
+                          return (
+                            <>
+                              {/* Top crop area */}
+                              <Box
+                                sx={{
+                                  position: "absolute",
+                                  top: 0,
+                                  left: 0,
+                                  right: 0,
+                                  height: `${topPixelsDisplay}px`,
+                                  backgroundColor: "rgba(255, 0, 0, 0.3)",
+                                  borderBottom: "2px solid red",
+                                  display: "flex",
+                                  alignItems: "center",
+                                  justifyContent: "center",
+                                  zIndex: 1
+                                }}
+                              >
+                                <Typography
+                                  variant="caption"
+                                  sx={{ color: "white", fontWeight: "bold", fontSize: "10px" }}
+                                >
+                                  HEADER: {cropSettings.top}px
+                                </Typography>
+                              </Box>
+
+                              {/* Bottom crop area */}
+                              <Box
+                                sx={{
+                                  position: "absolute",
+                                  bottom: 0,
+                                  left: 0,
+                                  right: 0,
+                                  height: `${bottomPixelsDisplay}px`,
+                                  backgroundColor: "rgba(255, 0, 0, 0.3)",
+                                  borderTop: "2px solid red",
+                                  display: "flex",
+                                  alignItems: "center",
+                                  justifyContent: "center",
+                                  zIndex: 1
+                                }}
+                              >
+                                <Typography
+                                  variant="caption"
+                                  sx={{ color: "white", fontWeight: "bold", fontSize: "10px" }}
+                                >
+                                  FOOTER: {cropSettings.bottom}px
+                                </Typography>
+                              </Box>
+                            </>
+                          )
+                        })()}
                       </Box>
                     </Document>
                   </Paper>
@@ -401,33 +447,56 @@ function App(): React.JSX.Element {
 
                     <Divider />
 
-                    {/* Crop Controls */}
+                    {/* Pixel-based Crop Controls */}
                     <Box>
                       <Typography variant="subtitle1" gutterBottom>
-                        Top Margin: {cropSettings.top}%
+                        Top Margin: {cropSettings.top}px (of {pageInfo.height}px total)
                       </Typography>
                       <Slider
                         value={cropSettings.top}
                         onChange={handleCropChange("top")}
                         valueLabelDisplay="auto"
                         min={0}
-                        max={50}
+                        max={Math.round(pageInfo.height * 0.4)} // Max 40% of page height
                         step={1}
                       />
                     </Box>
 
                     <Box>
                       <Typography variant="subtitle1" gutterBottom>
-                        Bottom Margin: {cropSettings.bottom}%
+                        Bottom Margin: {cropSettings.bottom}px (of {pageInfo.height}px total)
                       </Typography>
                       <Slider
                         value={cropSettings.bottom}
                         onChange={handleCropChange("bottom")}
                         valueLabelDisplay="auto"
                         min={0}
-                        max={50}
+                        max={Math.round(pageInfo.height * 0.4)} // Max 40% of page height
                         step={1}
                       />
+                    </Box>
+
+                    {/* Pixel Crop Summary */}
+                    <Box
+                      sx={{
+                        mt: 2,
+                        p: 2,
+                        bgcolor: "background.paper",
+                        borderRadius: 1,
+                        border: 1,
+                        borderColor: "divider"
+                      }}
+                    >
+                      <Typography variant="body2" color="text.secondary">
+                        <strong>📏 Pixel-based Cropping:</strong>
+                        <br />• PDF Page: {Math.floor(pageInfo.width)}x{Math.floor(pageInfo.height)}
+                        px
+                        <br />• Crop Top: {cropSettings.top}px
+                        <br />• Crop Bottom: {cropSettings.bottom}px
+                        <br />• Kept Area:{" "}
+                        {Math.floor(pageInfo.height) - cropSettings.top - cropSettings.bottom}px
+                        height
+                      </Typography>
                     </Box>
                   </Stack>
                 </Box>
@@ -438,7 +507,7 @@ function App(): React.JSX.Element {
 
         {/* Processing Section */}
         {pdfFile && (
-          <Card>
+          <Card sx={{ height: "max-content" }}>
             <CardContent>
               <Typography variant="h6" gutterBottom>
                 3. Generate Audiobook
@@ -487,18 +556,6 @@ function App(): React.JSX.Element {
             </CardContent>
           </Card>
         )}
-
-        {/* Test Section */}
-        <Card>
-          <CardContent>
-            <Typography variant="h6" gutterBottom>
-              Test Speech Generation
-            </Typography>
-            <Button variant="outlined" onClick={testSpeechGeneration}>
-              Test TTS
-            </Button>
-          </CardContent>
-        </Card>
       </Stack>
     </Container>
   )
