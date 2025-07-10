@@ -6,6 +6,7 @@ import { promises as fs } from "fs"
 import { pdfToPng } from "pdf-to-png-converter"
 import sharp from "sharp"
 import { createWorker } from "tesseract.js"
+import { tesseractCodes } from "../renderer/src/utils/languages"
 
 function createWindow(): void {
   // Create the browser window.
@@ -75,89 +76,93 @@ app.on("window-all-closed", () => {
 })
 
 // IPC handler for audiobook processing
-ipcMain.handle("process-audiobook", async (_event, { pdfBuffer, pageRange, cropSettings }) => {
-  try {
-    console.log("Processing audiobook request:", {
-      pageRange,
-      cropSettings,
-      pdfBufferLength: pdfBuffer.length
-    })
+ipcMain.handle(
+  "process-audiobook",
+  async (_event, { pdfBuffer, pageRange, cropSettings, language }) => {
+    try {
+      console.log("Processing audiobook request:", {
+        pageRange,
+        cropSettings,
+        pdfBufferLength: pdfBuffer.length
+      })
 
-    const [startPage, endPage] = pageRange
-    const pagesToProcess = endPage - startPage + 1
+      const [startPage, endPage] = pageRange
+      const pagesToProcess = endPage - startPage + 1
 
-    console.log(`Crop settings: top=${cropSettings.top}px, bottom=${cropSettings.bottom}px`)
+      console.log(`Crop settings: top=${cropSettings.top}px, bottom=${cropSettings.bottom}px`)
 
-    const images = await pdfToPng(pdfBuffer, {
-      outputFolder: "libre-lyre-temp",
-      viewportScale: 2,
-      outputFileMaskFunc: (pageNumber) => `page_${pageNumber}.png`,
-      disableFontFace: true,
-      pagesToProcess: [startPage, endPage]
-    })
+      const images = await pdfToPng(pdfBuffer, {
+        outputFolder: "libre-lyre-temp",
+        viewportScale: 2,
+        outputFileMaskFunc: (pageNumber) => `page_${pageNumber}.png`,
+        disableFontFace: true,
+        pagesToProcess: [startPage, endPage]
+      })
 
-    const topMarginPx = cropSettings.top * 2 // times two because we scaled the image by 2
-    const bottomMarginPx = cropSettings.bottom * 2 // times two because we scaled the image by 2
+      const topMarginPx = cropSettings.top * 2 // times two because we scaled the image by 2
+      const bottomMarginPx = cropSettings.bottom * 2 // times two because we scaled the image by 2
 
-    const worker = await createWorker("eng")
+      const languageCode = tesseractCodes.find((l) => l.name === language)?.code || "eng"
+      const worker = await createWorker(languageCode)
 
-    let extractedText = ""
+      let extractedText = ""
 
-    for (const image of images) {
-      const imageBuffer = image.content
-      const imageHeight = image.height
-      const imageWidth = image.width
+      for (const image of images) {
+        const imageBuffer = image.content
+        const imageHeight = image.height
+        const imageWidth = image.width
 
-      const sharpOptions = {
-        left: 0,
-        top: topMarginPx,
-        width: Math.floor(imageWidth),
-        height: Math.floor(imageHeight - topMarginPx - bottomMarginPx)
+        const sharpOptions = {
+          left: 0,
+          top: topMarginPx,
+          width: Math.floor(imageWidth),
+          height: Math.floor(imageHeight - topMarginPx - bottomMarginPx)
+        }
+
+        console.log("Cropping image")
+        const croppedImageBuffer = await sharp(imageBuffer).extract(sharpOptions).toBuffer()
+
+        const {
+          data: { text }
+        } = await worker.recognize(croppedImageBuffer)
+        extractedText += text
+
+        console.log("Extracted text from page: " + image.pageNumber, "text: " + text)
       }
 
-      console.log("Cropping image")
-      const croppedImageBuffer = await sharp(imageBuffer).extract(sharpOptions).toBuffer()
+      // Cleanup any words broken by line (e.g. "con- fusedly" -> "confusedly")
+      // Fix hyphenated words at line breaks (e.g., "con-\nfusedly" -> "confusedly")
+      const cleanedText = extractedText
+        .replace(/\s+/g, " ") // Replace multiple spaces with single space
+        .replace(/\n+/g, "\n") // Replace multiple newlines with single newline
+        .replace(/(\w+)-\s+(\w+)/g, "$1$2") // Hyphen + space
+        .replace(/(\w+)-\n(\w+)/g, "$1$2") // Hyphen + newline
+        .replace(/\n/g, " ") // Replace newlines with spaces
+      console.log("Cleaned text:", cleanedText)
 
-      const {
-        data: { text }
-      } = await worker.recognize(croppedImageBuffer)
-      extractedText += text
+      // Debug logging
+      console.log(`Extracted text length: ${cleanedText.length} characters`)
+      console.log(`First 200 characters: ${cleanedText.substring(0, 200)}...`)
+      console.log(`Last 200 characters: ...${cleanedText.substring(cleanedText.length - 200)}`)
+      console.log(`Pages processed: ${pagesToProcess} (from page ${startPage} to ${endPage})`)
 
-      console.log("Extracted text from page: " + image.pageNumber, "text: " + text)
-    }
+      // Delete temp folder
+      fs.rmdir("libre-lyre-temp", { recursive: true })
 
-    // Cleanup any words broken by line (e.g. "con- fusedly" -> "confusedly")
-    // Fix hyphenated words at line breaks (e.g., "con-\nfusedly" -> "confusedly")
-    const cleanedText = extractedText
-      .replace(/\s+/g, " ") // Replace multiple spaces with single space
-      .replace(/\n+/g, "\n") // Replace multiple newlines with single newline
-      .replace(/(\w+)-\s+(\w+)/g, "$1$2") // Hyphen + space
-      .replace(/(\w+)-\n(\w+)/g, "$1$2") // Hyphen + newline
-      .replace(/\n/g, " ") // Replace newlines with spaces
-    console.log("Cleaned text:", cleanedText)
-
-    // Debug logging
-    console.log(`Extracted text length: ${cleanedText.length} characters`)
-    console.log(`First 200 characters: ${cleanedText.substring(0, 200)}...`)
-    console.log(`Last 200 characters: ...${cleanedText.substring(cleanedText.length - 200)}`)
-    console.log(`Pages processed: ${pagesToProcess} (from page ${startPage} to ${endPage})`)
-
-    // Delete temp folder
-    fs.rmdir("libre-lyre-temp", { recursive: true })
-
-    return {
-      success: true,
-      text: cleanedText,
-      pageCount: pagesToProcess
-    }
-  } catch (error) {
-    console.error("PDF processing error:", error)
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown processing error"
+      return {
+        success: true,
+        text: cleanedText,
+        pageCount: pagesToProcess
+      }
+    } catch (error) {
+      console.error("PDF processing error:", error)
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Unknown processing error"
+      }
     }
   }
-})
+)
 
 // IPC handler for audio buffer concatenation (no file saving required)
 ipcMain.handle("concatenate-audio-buffers", async (_event, { audioData, outputFile }) => {
